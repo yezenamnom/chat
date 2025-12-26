@@ -3,9 +3,6 @@ import type { Message } from "@/types"
 
 const FREE_MODELS = [
   "xiaomi/mimo-v2-flash:free",
-  "google/gemini-2.0-flash-exp:free",
-  "meta-llama/llama-3.2-3b-instruct:free",
-  "mistralai/mistral-7b-instruct:free",
 ]
 
 function selectBestModel(): string {

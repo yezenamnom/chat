@@ -49,7 +49,7 @@ export class MultiAgentSystem {
     {
       id: "data-analyst",
       name: "Data Analyst",
-      model: "huggingface/meta-llama/Llama-3.1-8B-Instruct:free",
+      model: "auto",
       role: "architect",
       specialty: "Data analysis and insights",
     },
@@ -330,7 +330,7 @@ Generate complete, production-ready code with:
     })
 
     const prompt = `
-You are a Data Analyst specializing in data analysis, statistics, and insights using Hugging Face models.
+You are a Data Analyst specializing in data analysis, statistics, and insights.
 
 Project: ${plan.projectName}
 Description: ${plan.description}
@@ -367,7 +367,7 @@ Generate complete, production-ready code with:
 - Data processing utilities
 - Type safety
 - Error handling
-- Integration with Hugging Face models for advanced analysis
+- Advanced data analysis and statistical modeling
     `
 
     return await this.callAgent("data-analyst", prompt)

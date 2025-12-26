@@ -9,7 +9,7 @@ import {
   Trash2,
   Download,
   Send,
-  // Mic,
+  Mic,
   Code,
   Zap,
   Brain,
@@ -48,6 +48,7 @@ import { ChatMessage } from "./chat-message"
 import { storage } from "@/lib/storage"
 import { themeManager, type Theme } from "@/lib/theme"
 import { AI_MODELS } from "@/lib/ai-models"
+import { VoiceAnimation } from "./voice-animation"
 
 export interface Message {
   id: string
@@ -91,6 +92,10 @@ export function ChatInterface() {
   const synthesisRef = useRef<SpeechSynthesisUtterance | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const currentAudioRef = useRef<HTMLAudioElement | null>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const speakTextRef = useRef<((text: string) => Promise<void>) | null>(null)
+  const restartListeningRef = useRef<(() => void) | null>(null)
 
   const [selectedVoice, setSelectedVoice] = useState("zeina")
   const [voiceSpeed, setVoiceSpeed] = useState(1.0)
@@ -176,7 +181,7 @@ export function ChatInterface() {
       const dataArray = new Uint8Array(bufferLength)
 
       const updateAudioLevel = () => {
-        if (analyserRef.current && isLiveMode) {
+        if (analyserRef.current && (isLiveMode || isListening)) {
           analyserRef.current.getByteFrequencyData(dataArray)
           const average = dataArray.reduce((a, b) => a + b) / bufferLength
           setAudioLevel(average / 255)
@@ -188,7 +193,7 @@ export function ChatInterface() {
     } catch (error) {
       console.error("Error setting up audio:", error)
     }
-  }, [isLiveMode])
+  }, [isLiveMode, isListening])
 
   const cleanupAudioAnalysis = useCallback(() => {
     if (streamRef.current) {
@@ -242,16 +247,29 @@ export function ChatInterface() {
 
   const startVoiceRecording = useCallback(async () => {
     if (isListening) {
+      // Stop recording
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop()
+      }
       if (recognitionRef.current) {
         recognitionRef.current.stop()
       }
       setIsListening(false)
       setVoiceState("idle")
-      setStatusText("توقفت التسجيل.")
+      setStatusText("قل شيئاً...")
+      cleanupAudioAnalysis()
+      
+      // Process recorded audio with Whisper
+      if (audioChunksRef.current.length > 0 && mediaRecorderRef.current) {
+        // Stop will trigger onstop which processes the audio
+        if (mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop()
+        }
+      }
       return
     }
 
-    await navigator.permissions.query({ name: "microphone" }).then((permissionStatus) => {
+    await navigator.permissions.query({ name: "microphone" as PermissionName }).then((permissionStatus) => {
       if (permissionStatus.state === "denied") {
         alert("الوصول إلى الميكروفون مرفوض. يرجى تمكين الوصول في إعدادات المتصفح.")
         return
@@ -259,19 +277,127 @@ export function ChatInterface() {
     })
 
     try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      
       await setupAudioAnalysis()
+      
+      // Initialize MediaRecorder for Whisper
+      try {
+        const mediaRecorder = new MediaRecorder(stream, {
+          mimeType: "audio/webm;codecs=opus",
+        })
+        mediaRecorderRef.current = mediaRecorder
+        audioChunksRef.current = []
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data)
+          }
+        }
+
+        mediaRecorder.onstop = async () => {
+          if (audioChunksRef.current.length > 0) {
+            const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" })
+            await processAudioWithWhisper(audioBlob, true)
+            audioChunksRef.current = []
+          }
+        }
+
+        mediaRecorder.start(100) // Collect data every 100ms
+      } catch (recorderError) {
+        console.log("MediaRecorder not supported, using Web Speech API fallback")
+      }
+
+      // Try Web Speech API as fallback
       if (recognitionRef.current) {
         recognitionRef.current.start()
-        setIsListening(true)
-        setVoiceState("listening")
-        setStatusText("استمع...")
       }
+      
+      setIsListening(true)
+      setVoiceState("listening")
+      setStatusText("قل شيئاً...")
     } catch (error) {
       console.error("Error starting voice recording:", error)
       setStatusText("خطأ في بدء التسجيل.")
       alert("حدث خطأ أثناء محاولة بدء التسجيل الصوتي.")
+      cleanupAudioAnalysis()
     }
-  }, [isListening, recognitionRef, setupAudioAnalysis])
+  }, [isListening, recognitionRef, setupAudioAnalysis, cleanupAudioAnalysis])
+
+  const processAudioWithWhisper = useCallback(async (audioBlob: Blob, autoSend: boolean = false) => {
+    try {
+      setStatusText("جاري معالجة الصوت...")
+      setVoiceState("idle")
+
+      const formData = new FormData()
+      formData.append("audio", audioBlob, "recording.webm")
+
+      const response = await fetch("/api/whisper", {
+        method: "POST",
+        body: formData,
+      })
+
+      const data = await response.json()
+
+      if (data.text) {
+        setInput(data.text)
+        // Auto-send if not in live mode and autoSend is true
+        if (!isLiveMode && data.text.trim() && autoSend) {
+          // Store text in a way that can be sent later
+          // We'll trigger send via form submit
+          const form = document.querySelector("form")
+          if (form) {
+            setTimeout(() => {
+              form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }))
+            }, 500)
+          }
+        } else if (isLiveMode && data.text.trim()) {
+          // For live mode, we'll handle it in the useEffect that sets up recognition
+          // Store the transcript to be processed
+          const transcript = data.text
+          // Call the chat API directly for live mode
+          try {
+            const chatResponse = await fetch("/api/chat", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                messages: [{ role: "user", content: transcript }],
+                model: selectedModel,
+                deepThinking,
+                enhancedAnalysis,
+                deepSearch: true,
+                focusMode,
+                isVoiceMode: true,
+              }),
+            })
+
+            const chatData = await chatResponse.json()
+            if (chatData.message) {
+              // Will be handled by speakText later
+              setMessages((prev) => [
+                ...prev,
+                { id: Date.now().toString(), role: "user", content: transcript, timestamp: new Date() },
+                { id: (Date.now() + 1).toString(), role: "assistant", content: chatData.message, timestamp: new Date() },
+              ])
+            }
+          } catch (error) {
+            console.error("Live mode chat error:", error)
+          }
+        }
+      } else if (data.fallback && recognitionRef.current) {
+        // Fallback to Web Speech API result if available
+        console.log("Using Web Speech API fallback")
+      } else {
+        setStatusText("فشل التعرف على الصوت")
+      }
+    } catch (error) {
+      console.error("Whisper processing error:", error)
+      setStatusText("خطأ في معالجة الصوت")
+    }
+  }, [isLiveMode, selectedModel, deepThinking, enhancedAnalysis, focusMode])
 
   useEffect(() => {
     const initRecognition = () => {
@@ -286,10 +412,68 @@ export function ChatInterface() {
           const transcript = event.results[event.results.length - 1][0].transcript
 
           if (isLiveMode) {
-            handleVoiceMessage(transcript)
+            // Handle live mode directly without calling handleVoiceMessage
+            if (transcript.trim()) {
+              // Process the transcript in live mode
+              setStatusText("معالجة...")
+              setVoiceState("idle")
+              setIsListening(false)
+              
+              // Call chat API directly
+              fetch("/api/chat", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  messages: [{ role: "user", content: transcript }],
+                  model: selectedModel,
+                  deepThinking,
+                  enhancedAnalysis,
+                  deepSearch: true,
+                  focusMode,
+                  isVoiceMode: true,
+                }),
+              })
+                .then((response) => response.json())
+                .then((data) => {
+                  if (data.message) {
+                    // Add messages to state
+                    setMessages((prev) => [
+                      ...prev,
+                      { id: Date.now().toString(), role: "user", content: transcript, timestamp: new Date() },
+                      { id: (Date.now() + 1).toString(), role: "assistant", content: data.message, timestamp: new Date() },
+                    ])
+                    // Speak the response using ref
+                    if (speakTextRef.current) {
+                      speakTextRef.current(data.message)
+                    }
+                  }
+                })
+                .catch((error) => {
+                  console.error("[v0] Voice error:", error)
+                  setStatusText("حدث خطأ...")
+                  setTimeout(() => {
+                    setStatusText("استمع...")
+                    setVoiceState("listening")
+                    if (isLiveMode && recognitionRef.current) {
+                      setTimeout(() => {
+                        try {
+                          recognitionRef.current.start()
+                          setIsListening(true)
+                        } catch (e) {
+                          console.log("[v0] Could not restart:", e)
+                        }
+                      }, 500)
+                    }
+                  }, 2000)
+                })
+            }
           } else {
             setInput(transcript)
             setIsListening(false)
+            setVoiceState("idle")
+            setStatusText("قل شيئاً...")
           }
         }
 
@@ -339,7 +523,7 @@ export function ChatInterface() {
       }
       cleanupAudioAnalysis()
     }
-  }, [isLiveMode])
+  }, [isLiveMode, selectedModel, deepThinking, enhancedAnalysis, focusMode])
 
   const handleVoiceMessage = useCallback(
     async (transcript: string) => {
@@ -448,10 +632,158 @@ export function ChatInterface() {
           setIsSpeaking(false)
           setVoiceState("listening")
           setStatusText("استمع...")
-          restartListening()
+          if (restartListeningRef.current) {
+            restartListeningRef.current()
+          }
           return
         }
 
+        // Try Google TTS (Gemini Flash Lite) with streaming first (like ChatGPT)
+        try {
+          const response = await fetch("/api/gemini-tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: cleanText,
+              language: "ar",
+              streaming: true,
+            }),
+          })
+
+          if (response.ok && response.body) {
+            console.log("[v0] Using Google TTS with streaming (Gemini Flash Lite)")
+            
+            // For streaming audio, collect chunks and play as they arrive
+            const reader = response.body.getReader()
+            const chunks: Uint8Array[] = []
+            let totalLength = 0
+
+            // Read all chunks
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              chunks.push(value)
+              totalLength += value.length
+            }
+
+            // Combine all chunks into a single blob
+            const combinedArray = new Uint8Array(totalLength)
+            let offset = 0
+            for (const chunk of chunks) {
+              combinedArray.set(chunk, offset)
+              offset += chunk.length
+            }
+
+            const audioBlob = new Blob([combinedArray], { type: "audio/mpeg" })
+            const audioUrl = URL.createObjectURL(audioBlob)
+            const audio = new Audio(audioUrl)
+            currentAudioRef.current = audio
+
+            // Start playing immediately (streaming-like experience)
+            audio.oncanplaythrough = () => {
+              audio.play().catch((err) => {
+                console.error("[v0] Error playing audio:", err)
+              })
+            }
+
+            audio.onended = () => {
+              console.log("[v0] Speech ended, resuming listening")
+              URL.revokeObjectURL(audioUrl)
+              currentAudioRef.current = null
+              setIsSpeaking(false)
+              setVoiceState("listening")
+              setStatusText("استمع...")
+              if (restartListeningRef.current) {
+                restartListeningRef.current()
+              }
+            }
+
+            audio.onerror = (err) => {
+              console.error("[v0] Audio playback error:", err)
+              URL.revokeObjectURL(audioUrl)
+              currentAudioRef.current = null
+              setIsSpeaking(false)
+              setVoiceState("listening")
+              setStatusText("استمع...")
+              if (restartListeningRef.current) {
+                restartListeningRef.current()
+              }
+            }
+
+            // Try to play immediately
+            try {
+              await audio.play()
+            } catch (playError) {
+              // If play fails, wait for canplaythrough
+              console.log("[v0] Waiting for audio to be ready...")
+            }
+
+            return
+          } else {
+            const errorData = await response.json().catch(() => ({}))
+            if (errorData.fallback) {
+              console.log("[v0] Google TTS unavailable, trying VITS")
+            }
+          }
+        } catch (googleError) {
+          console.log("[v0] Google TTS failed, trying VITS:", googleError)
+        }
+
+        // Try VITS API as fallback
+        try {
+          const response = await fetch("/api/vits", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: cleanText,
+              language: "ar",
+              speaker_id: 0,
+            }),
+          })
+
+          if (response.ok) {
+            const audioBlob = await response.blob()
+            const audioUrl = URL.createObjectURL(audioBlob)
+            const audio = new Audio(audioUrl)
+            currentAudioRef.current = audio
+
+            audio.onended = () => {
+              console.log("[v0] Speech ended, resuming listening")
+              URL.revokeObjectURL(audioUrl)
+              currentAudioRef.current = null
+              setIsSpeaking(false)
+              setVoiceState("listening")
+              setStatusText("استمع...")
+              if (restartListeningRef.current) {
+                restartListeningRef.current()
+              }
+            }
+
+            audio.onerror = (err) => {
+              console.error("[v0] Audio playback error:", err)
+              URL.revokeObjectURL(audioUrl)
+              currentAudioRef.current = null
+              setIsSpeaking(false)
+              setVoiceState("listening")
+              setStatusText("استمع...")
+              if (restartListeningRef.current) {
+                restartListeningRef.current()
+              }
+            }
+
+            await audio.play()
+            return
+          } else {
+            const errorData = await response.json()
+            if (errorData.fallback) {
+              console.log("[v0] VITS API unavailable, falling back to Web Speech")
+            }
+          }
+        } catch (vitsError) {
+          console.log("[v0] VITS API failed, falling back to Web Speech:", vitsError)
+        }
+
+        // Fallback to Web Speech API
         // Voice features temporarily disabled
         const voiceOption = undefined as any
 
@@ -484,7 +816,9 @@ export function ChatInterface() {
                   setIsSpeaking(false)
                   setVoiceState("listening")
                   setStatusText("استمع...")
-                  restartListening()
+                  if (restartListeningRef.current) {
+                    restartListeningRef.current()
+                  }
                 }
 
                 audio.onerror = (err) => {
@@ -494,7 +828,9 @@ export function ChatInterface() {
                   setIsSpeaking(false)
                   setVoiceState("listening")
                   setStatusText("استمع...")
-                  restartListening()
+                  if (restartListeningRef.current) {
+                    restartListeningRef.current()
+                  }
                 }
 
                 await audio.play()
@@ -534,7 +870,9 @@ export function ChatInterface() {
             setIsSpeaking(false)
             setVoiceState("listening")
             setStatusText("استمع...")
-            restartListening()
+            if (restartListeningRef.current) {
+              restartListeningRef.current()
+            }
           }
 
           utterance.onerror = (err) => {
@@ -545,7 +883,9 @@ export function ChatInterface() {
             setIsSpeaking(false)
             setVoiceState("idle")
             setStatusText("قل شيئاً...")
-            restartListening()
+            if (restartListeningRef.current) {
+              restartListeningRef.current()
+            }
           }
 
           synthesisRef.current = utterance
@@ -566,23 +906,10 @@ export function ChatInterface() {
     [selectedVoice, voiceSpeed, pitch, volume, isLiveMode],
   )
 
-  const stopSpeaking = useCallback(() => {
-    // Stop HTML5 audio
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause()
-      currentAudioRef.current.currentTime = 0
-      currentAudioRef.current = null
-    }
-
-    // Stop Web Speech API
-    if (window.speechSynthesis) {
-      window.speechSynthesis.cancel()
-    }
-
-    setIsSpeaking(false)
-    setVoiceState("idle")
-    setStatusText("قل شيئاً...")
-  }, [])
+  // Update speakText ref when it changes
+  useEffect(() => {
+    speakTextRef.current = speakText
+  }, [speakText])
 
   const restartListening = useCallback(() => {
     if (isLiveMode && recognitionRef.current) {
@@ -600,6 +927,29 @@ export function ChatInterface() {
       }, 500)
     }
   }, [isLiveMode])
+
+  // Update restartListening ref when it changes
+  useEffect(() => {
+    restartListeningRef.current = restartListening
+  }, [restartListening])
+
+  const stopSpeaking = useCallback(() => {
+    // Stop HTML5 audio
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause()
+      currentAudioRef.current.currentTime = 0
+      currentAudioRef.current = null
+    }
+
+    // Stop Web Speech API
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel()
+    }
+
+    setIsSpeaking(false)
+    setVoiceState("idle")
+    setStatusText("قل شيئاً...")
+  }, [])
 
   const speak = (text: string) => {
     speakText(text)
@@ -1216,8 +1566,113 @@ export function ChatInterface() {
               </div>
             )}
 
+            {/* Voice Interface - Professional Animation */}
+            {(isListening || isSpeaking || voiceState !== "idle") && (
+              <div className="flex flex-col items-center justify-center gap-6 py-8 mb-3 min-h-[400px]">
+                {/* Professional Voice Animation */}
+                <VoiceAnimation 
+                  audioLevel={audioLevel} 
+                  state={isListening ? "listening" : isSpeaking ? "speaking" : "idle"}
+                  size="lg"
+                />
+                
+                {/* Status text with dynamic color */}
+                <div className="text-center mt-4">
+                  <p 
+                    className="text-xl font-semibold mb-2 transition-colors duration-300" 
+                    dir="rtl"
+                    style={{
+                      color: isListening 
+                        ? "rgb(255, 215, 0)" // ذهبي
+                        : isSpeaking 
+                        ? "rgb(64, 224, 208)" // فيروزي
+                        : "rgb(192, 192, 192)" // فضي
+                    }}
+                  >
+                    {statusText}
+                  </p>
+                  {(isListening || isSpeaking) && (
+                    <div className="flex items-center justify-center gap-1.5 mt-3">
+                      <div 
+                        className="h-1.5 w-1.5 rounded-full animate-pulse" 
+                        style={{
+                          backgroundColor: isListening ? "rgb(255, 215, 0)" : "rgb(64, 224, 208)",
+                          animationDelay: '0s'
+                        }} 
+                      />
+                      <div 
+                        className="h-1.5 w-1.5 rounded-full animate-pulse" 
+                        style={{
+                          backgroundColor: isListening ? "rgb(255, 215, 0)" : "rgb(64, 224, 208)",
+                          animationDelay: '0.2s'
+                        }} 
+                      />
+                      <div 
+                        className="h-1.5 w-1.5 rounded-full animate-pulse" 
+                        style={{
+                          backgroundColor: isListening ? "rgb(255, 215, 0)" : "rgb(64, 224, 208)",
+                          animationDelay: '0.4s'
+                        }} 
+                      />
+                    </div>
+                  )}
+                </div>
+                
+                {/* Control buttons */}
+                <div className="flex items-center gap-4 mt-4">
+                  {isListening && (
+                    <Button
+                      type="button"
+                      size="icon"
+                      onClick={startVoiceRecording}
+                      className="relative h-16 w-16 rounded-full bg-gradient-to-br from-yellow-400 to-yellow-600 hover:from-yellow-500 hover:to-yellow-700 z-10 shadow-lg border-2 border-yellow-300"
+                      title="إيقاف التسجيل"
+                    >
+                      <Mic className="h-8 w-8 text-white" />
+                      <div className="absolute inset-0 rounded-full bg-yellow-400 animate-ping opacity-50" />
+                    </Button>
+                  )}
+                  
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => {
+                      if (recognitionRef.current) {
+                        recognitionRef.current.stop()
+                      }
+                      if (currentAudioRef.current) {
+                        currentAudioRef.current.pause()
+                        currentAudioRef.current = null
+                      }
+                      setIsListening(false)
+                      setIsSpeaking(false)
+                      setVoiceState("idle")
+                      setStatusText("قل شيئاً...")
+                      cleanupAudioAnalysis()
+                    }}
+                    className="h-12 w-12 rounded-full border border-border/50 hover:bg-muted/50"
+                    title="إلغاء"
+                  >
+                    <X className="h-6 w-6" />
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {/* Desktop Input */}
             <div className="hidden md:flex items-end gap-2 mb-3" dir="rtl">
+              <Button
+                type="button"
+                size="icon"
+                onClick={startVoiceRecording}
+                variant={isListening ? "default" : "outline"}
+                className={`h-10 w-10 shrink-0 rounded-xl ${isListening ? "animate-pulse" : ""}`}
+                title={isListening ? "إيقاف التسجيل" : "بدء التسجيل الصوتي"}
+              >
+                <Mic className="h-5 w-5" />
+              </Button>
+              
               <Input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -1247,7 +1702,7 @@ export function ChatInterface() {
               <Button
                 type="submit"
                 size="icon"
-                disabled={!input.trim()}
+                disabled={!input.trim() && !isListening}
                 className="h-10 w-10 shrink-0 rounded-xl"
                 title={isLoading ? "إضافة إلى قائمة الانتظار" : "إرسال"}
               >
@@ -1387,44 +1842,149 @@ export function ChatInterface() {
 
 
             <div className="flex md:hidden flex-col gap-2" dir="rtl">
-              {/* Mobile Input Field */}
-              <div className="flex gap-2 rounded-2xl border border-border/50 bg-background p-2">
-                <Input
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault()
-                      handleSubmit(e)
-                    }
-                  }}
-                  placeholder={selectedImage ? "اكتب ماذا تريد من هذه الصورة..." : isLoading ? "اكتب رسالة جديدة (ستُضاف إلى قائمة الانتظار)..." : "اطرح متابعة..."}
-                  className="flex-1 border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0 text-right px-2"
-                  dir="rtl"
-                />
-
-                {isLoading && (
-                  <Button 
-                    type="button" 
-                    size="icon" 
-                    onClick={handleStop} 
-                    className="h-10 w-10" 
-                    variant="destructive"
-                    title="إيقاف الإجابة الحالية"
+              {/* Mobile Voice Interface */}
+              {(isListening || isSpeaking || voiceState !== "idle") ? (
+                <div className="flex flex-col items-center justify-center gap-6 py-8 min-h-[400px]">
+                  {/* Professional Voice Animation */}
+                  <VoiceAnimation 
+                    audioLevel={audioLevel} 
+                    state={isListening ? "listening" : isSpeaking ? "speaking" : "idle"}
+                    size="lg"
+                  />
+                  
+                  {/* Status text with dynamic color */}
+                  <div className="text-center mt-4">
+                    <p 
+                      className="text-xl font-semibold mb-2 transition-colors duration-300" 
+                      dir="rtl"
+                      style={{
+                        color: isListening 
+                          ? "rgb(255, 215, 0)" // ذهبي
+                          : isSpeaking 
+                          ? "rgb(64, 224, 208)" // فيروزي
+                          : "rgb(192, 192, 192)" // فضي
+                      }}
+                    >
+                      {statusText}
+                    </p>
+                    {(isListening || isSpeaking) && (
+                      <div className="flex items-center justify-center gap-1.5 mt-3">
+                        <div 
+                          className="h-1.5 w-1.5 rounded-full animate-pulse" 
+                          style={{
+                            backgroundColor: isListening ? "rgb(255, 215, 0)" : "rgb(64, 224, 208)",
+                            animationDelay: '0s'
+                          }} 
+                        />
+                        <div 
+                          className="h-1.5 w-1.5 rounded-full animate-pulse" 
+                          style={{
+                            backgroundColor: isListening ? "rgb(255, 215, 0)" : "rgb(64, 224, 208)",
+                            animationDelay: '0.2s'
+                          }} 
+                        />
+                        <div 
+                          className="h-1.5 w-1.5 rounded-full animate-pulse" 
+                          style={{
+                            backgroundColor: isListening ? "rgb(255, 215, 0)" : "rgb(64, 224, 208)",
+                            animationDelay: '0.4s'
+                          }} 
+                        />
+                      </div>
+                    )}
+                  </div>
+                  
+                  {/* Control buttons */}
+                  <div className="flex items-center gap-4 mt-4">
+                    {isListening && (
+                      <Button
+                        type="button"
+                        size="icon"
+                        onClick={startVoiceRecording}
+                        className="relative h-20 w-20 rounded-full bg-gradient-to-br from-yellow-400 to-yellow-600 hover:from-yellow-500 hover:to-yellow-700 z-10 shadow-lg border-2 border-yellow-300"
+                        title="إيقاف التسجيل"
+                      >
+                        <Mic className="h-10 w-10 text-white" />
+                        <div className="absolute inset-0 rounded-full bg-yellow-400 animate-ping opacity-50" />
+                      </Button>
+                    )}
+                    
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => {
+                        if (recognitionRef.current) {
+                          recognitionRef.current.stop()
+                        }
+                        if (currentAudioRef.current) {
+                          currentAudioRef.current.pause()
+                          currentAudioRef.current = null
+                        }
+                        setIsListening(false)
+                        setIsSpeaking(false)
+                        setVoiceState("idle")
+                        setStatusText("قل شيئاً...")
+                        cleanupAudioAnalysis()
+                      }}
+                      className="h-14 w-14 rounded-full border border-border/50 hover:bg-muted/50"
+                      title="إلغاء"
+                    >
+                      <X className="h-7 w-7" />
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                /* Mobile Input Field */
+                <div className="flex gap-2 rounded-2xl border border-border/50 bg-background p-2">
+                  <Button
+                    type="button"
+                    size="icon"
+                    onClick={startVoiceRecording}
+                    variant="outline"
+                    className="h-10 w-10 shrink-0 rounded-xl"
+                    title="بدء التسجيل الصوتي"
                   >
-                    <Square className="h-5 w-5" />
+                    <Mic className="h-5 w-5" />
                   </Button>
-                )}
-                <Button 
-                  type="submit" 
-                  size="icon" 
-                  disabled={!input.trim()} 
-                  className="h-10 w-10"
-                  title={isLoading ? "إضافة إلى قائمة الانتظار" : "إرسال"}
-                >
-                  <Send className="h-5 w-5" />
-                </Button>
-              </div>
+                  
+                  <Input
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault()
+                        handleSubmit(e)
+                      }
+                    }}
+                    placeholder={selectedImage ? "اكتب ماذا تريد من هذه الصورة..." : isLoading ? "اكتب رسالة جديدة (ستُضاف إلى قائمة الانتظار)..." : "اطرح متابعة..."}
+                    className="flex-1 border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0 text-right px-2"
+                    dir="rtl"
+                  />
+
+                  {isLoading && (
+                    <Button 
+                      type="button" 
+                      size="icon" 
+                      onClick={handleStop} 
+                      className="h-10 w-10" 
+                      variant="destructive"
+                      title="إيقاف الإجابة الحالية"
+                    >
+                      <Square className="h-5 w-5" />
+                    </Button>
+                  )}
+                  <Button 
+                    type="submit" 
+                    size="icon" 
+                    disabled={!input.trim()} 
+                    className="h-10 w-10"
+                    title={isLoading ? "إضافة إلى قائمة الانتظار" : "إرسال"}
+                  >
+                    <Send className="h-5 w-5" />
+                  </Button>
+                </div>
+              )}
 
               {/* Mobile quick actions */}
               <div className="flex items-center justify-center gap-2">

@@ -5,39 +5,65 @@ import { sanitizeInput, validateImageData } from "@/lib/security"
 import type { Message } from "@/types"
 
 const FREE_MODELS = [
-  // Prioritize explicit :free models to avoid quota/paid-plan issues.
-  "google/gemini-2.0-flash-exp:free", // Fast + vision
-  "meta-llama/llama-3.2-3b-instruct:free", // Fast alternative
-  "mistralai/mistral-7b-instruct:free", // Solid backup
-  "google/gemini-2.0-flash-thinking-exp:free", // For reasoning
-  // Keep DeepSeek as a last fallback (may be rate-limited / not always free depending on provider)
-  "deepseek/deepseek-chat",
+  // نماذج مجانية - للدردشة والصور فقط
+  "xiaomi/mimo-v2-flash:free", // للدردشة والاستخدام العام
+  "nvidia/nemotron-nano-12b-v2-vl:free", // للصور والرؤية الحاسوبية
 ]
 
 function selectBestModel(query: string): string {
   const lowerQuery = query.toLowerCase()
 
-  // Code related queries
-  if (/\b(code|function|class|variable|python|javascript|typescript|react|node|api|debug|error|fix)\b/i.test(query)) {
-    return "google/gemini-2.0-flash-exp:free" // Good and explicit free
-  }
-
-  // Image/vision queries - use Gemini only if really needed
+  // Image/vision queries - استخدام Nemotron للصور
   if (/\b(image|picture|photo|see|look|analyze|visual|describe)\b/i.test(query)) {
-    return "google/gemini-2.0-flash-exp:free" // Has vision
+    return "nvidia/nemotron-nano-12b-v2-vl:free" // يدعم الصور
   }
 
-  // Analysis/reasoning queries
-  if (/\b(analyze|compare|explain|why|how|reason|think|detailed)\b/i.test(query)) {
-    return "google/gemini-2.0-flash-thinking-exp:free"
-  }
-
-  return "google/gemini-2.0-flash-exp:free"
+  // باقي الاستعلامات - استخدام Xiaomi للدردشة
+  return "xiaomi/mimo-v2-flash:free" // للدردشة والاستخدام العام
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function callOpenRouter(messages: Message[], modelId: string, systemPrompt?: string): Promise<string> {
+// Exponential backoff للانتظار بين المحاولات
+async function exponentialBackoff(attempt: number, baseDelay = 1000): Promise<void> {
+  const delayMs = baseDelay * Math.pow(2, attempt)
+  const maxDelay = 10000 // أقصى انتظار 10 ثواني
+  const finalDelay = Math.min(delayMs, maxDelay)
+  console.log(`[v0] Waiting ${finalDelay}ms before retry (attempt ${attempt + 1})`)
+  await delay(finalDelay)
+}
+
+// معالجة أخطاء OpenRouter بشكل أفضل
+function handleOpenRouterError(response: Response, errorData: any): Error {
+  const status = response.status
+  const errorMessage = errorData?.error?.message || "خطأ غير معروف"
+
+  if (status === 429) {
+    // Rate limit exceeded
+    return new Error("RATE_LIMITED")
+  }
+
+  if (status === 503 || status === 502) {
+    // Service unavailable/busy
+    return new Error("SERVICE_BUSY")
+  }
+
+  if (status === 401 || status === 403) {
+    // Authentication error
+    return new Error("API_KEY_INVALID")
+  }
+
+  // خطأ عام
+  return new Error(errorMessage)
+}
+
+async function callOpenRouter(
+  messages: Message[],
+  modelId: string,
+  systemPrompt?: string,
+  retryCount = 0,
+  maxRetries = 0, // لا retry للـ rate limit - تخطي النموذج مباشرة
+): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY
 
   if (!apiKey || apiKey.trim() === "" || apiKey === "your-openrouter-api-key-here" || apiKey === "sk-or-v1-your-api-key-here") {
@@ -52,12 +78,23 @@ async function callOpenRouter(messages: Message[], modelId: string, systemPrompt
     typeof systemPrompt === "string" && systemPrompt.trim() !== "" ? systemPrompt : "أنت مساعد ذكي ومفيد."
 
   const formattedMessages = messages
-    .map((msg) => {
-      const content = typeof msg.content === "string" ? msg.content.trim() : ""
-      if (!content) return null
-      return { role: msg.role, content }
+    .filter((msg: Message) => msg.content && msg.content.trim() !== "")
+    .map((msg: Message) => {
+      const cleanContent = (msg.content || "").trim()
+      if (!cleanContent) return null
+
+      if (msg.image) {
+        return {
+          role: msg.role,
+          content: [
+            { type: "image_url", image_url: { url: msg.image } },
+            { type: "text", text: cleanContent },
+          ],
+        }
+      }
+      return { role: msg.role, content: cleanContent }
     })
-    .filter((msg): msg is { role: string; content: string } => msg !== null)
+    .filter((msg) => msg !== null)
 
   if (formattedMessages.length === 0) {
     throw new Error("لا توجد رسائل صالحة")
@@ -65,30 +102,71 @@ async function callOpenRouter(messages: Message[], modelId: string, systemPrompt
 
   const finalMessages = [{ role: "system", content: validSystemMessage }, ...formattedMessages]
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000",
-      "X-Title": "AI Chat Assistant",
-    },
-    body: JSON.stringify({
-      model: actualModel,
-      messages: finalMessages,
-      temperature: 0.7,
-      max_tokens: 4000,
-    }),
-  })
+  try {
+    // إضافة timeout للطلب (30 ثانية)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 30000)
 
-  if (!response.ok) {
-    const error = await response.json()
-    console.error("[v0] OpenRouter error:", error)
-    throw new Error(error.error?.message || "OpenRouter API error")
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000",
+        "X-Title": "AI Chat Assistant",
+      },
+      body: JSON.stringify({
+        model: actualModel,
+        messages: finalMessages,
+        temperature: 0.7,
+        max_tokens: 4000,
+      }),
+      signal: controller.signal,
+    })
+
+    clearTimeout(timeoutId)
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}))
+      const error = handleOpenRouterError(response, errorData)
+
+      // Retry للـ service busy فقط (لا retry للـ rate limit)
+      if (error.message === "SERVICE_BUSY" && retryCount < maxRetries) {
+        console.log(`[v0] Retrying ${actualModel} (${retryCount + 1}/${maxRetries})...`)
+        await exponentialBackoff(retryCount)
+        return callOpenRouter(messages, modelId, systemPrompt, retryCount + 1, maxRetries)
+      }
+      
+      // إذا كان Rate Limit، ارمي الخطأ مباشرة بدون retry
+      if (error.message === "RATE_LIMITED") {
+        throw error // تخطي هذا النموذج مباشرة
+      }
+
+      throw error
+    }
+
+    const data = await response.json()
+    const content = data.choices?.[0]?.message?.content
+
+    if (!content || content.trim() === "") {
+      throw new Error("استجابة فارغة من النموذج")
+    }
+
+    return content
+  } catch (error: any) {
+    if (error.name === "AbortError") {
+      throw new Error("انتهت مهلة الانتظار. يرجى المحاولة مرة أخرى.")
+    }
+
+    // Retry للأخطاء الشبكية
+    if (retryCount < maxRetries && (error.message.includes("fetch") || error.message.includes("network"))) {
+      console.log(`[v0] Network error, retrying (${retryCount + 1}/${maxRetries})...`)
+      await exponentialBackoff(retryCount)
+      return callOpenRouter(messages, modelId, systemPrompt, retryCount + 1, maxRetries)
+    }
+
+    throw error
   }
-
-  const data = await response.json()
-  return data.choices?.[0]?.message?.content
 }
 
 function removeChinese(text: string): string {
@@ -102,10 +180,12 @@ async function callOpenRouterStreaming(
   systemPrompt?: string,
   temperature = 0.7,
   onChunk?: (chunk: string) => void,
+  retryCount = 0,
+  maxRetries = 0, // لا retry للـ rate limit - تخطي النموذج مباشرة
 ): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY
 
-  if (!apiKey || apiKey.trim() === "" || apiKey === "your-api-key-here") {
+  if (!apiKey || apiKey.trim() === "" || apiKey === "your-api-key-here" || apiKey === "your-openrouter-api-key-here" || apiKey === "sk-or-v1-your-api-key-here") {
     console.error("[v0] OpenRouter API key is not configured properly")
     const errorMsg =
       "⚠️ لم يتم تكوين مفتاح API. الرجاء إضافة OPENROUTER_API_KEY في ملف .env.local\n\nللحصول على مفتاح مجاني: https://openrouter.ai/keys"
@@ -115,7 +195,7 @@ async function callOpenRouterStreaming(
 
   const actualModel = modelId === "auto" ? selectBestModel(messages[messages.length - 1]?.content || "") : modelId
 
-  console.log("[v0] Using model:", actualModel)
+  console.log("[v0] Using model:", actualModel, retryCount > 0 ? `(retry ${retryCount})` : "")
 
   const formattedMessages = messages
     .filter((msg: Message) => msg.content && msg.content.trim() !== "")
@@ -146,6 +226,10 @@ async function callOpenRouterStreaming(
   const finalMessages = [{ role: "system", content: validSystemMessage }, ...formattedMessages]
 
   try {
+    // إضافة timeout للطلب (60 ثانية للـ streaming)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 60000)
+
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -161,20 +245,38 @@ async function callOpenRouterStreaming(
         max_tokens: 4000,
         stream: true,
       }),
+      signal: controller.signal,
     })
+
+    clearTimeout(timeoutId)
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
+      const error = handleOpenRouterError(response, errorData)
       console.error("[v0] OpenRouter streaming error:", errorData)
 
-      if (response.status === 429 || errorData?.error?.code === 429) {
-        throw new Error("RATE_LIMITED")
+      // لا retry على الإطلاق - ارمي الخطأ مباشرة
+      // إذا كان Rate Limit، ارمي الخطأ مباشرة
+      if (error.message === "RATE_LIMITED") {
+        throw error // تخطي هذا النموذج مباشرة
       }
 
-      // Don't show plan/upgrade wording; treat as temporary provider congestion.
-      const errorMsg = "عذراً، الخدمة مشغولة حالياً. يرجى المحاولة بعد قليل."
-      if (onChunk) onChunk(errorMsg)
-      throw new Error(errorMsg)
+      // رسائل خطأ واضحة
+      let errorMsg = ""
+      if (error.message === "RATE_LIMITED") {
+        errorMsg = "تم تجاوز الحد المسموح. يرجى الانتظار قليلاً ثم المحاولة مرة أخرى."
+      } else if (error.message === "API_KEY_INVALID") {
+        errorMsg = "⚠️ مفتاح API غير صحيح. يرجى التحقق من OPENROUTER_API_KEY"
+      }
+
+      // إذا كان هناك رسالة خطأ، أرسلها، وإلا ارمي الخطأ مباشرة (للتجربة مع نموذج بديل)
+      if (errorMsg) {
+        if (onChunk) onChunk(errorMsg)
+        throw new Error(errorMsg)
+      }
+      
+      // إذا لم تكن هناك رسالة خطأ محددة، ارمي الخطأ مباشرة (للتجربة مع نموذج بديل)
+      throw error
     }
 
     const reader = response.body?.getReader()
@@ -218,10 +320,23 @@ async function callOpenRouterStreaming(
     return fullResponse || "عذراً، لم أتمكن من إنشاء رد."
   } catch (error: any) {
     console.error("[v0] Streaming error:", error.message)
-    if (error.message === "RATE_LIMITED") {
-      throw error
+
+    // Retry للأخطاء الشبكية
+    if (retryCount < maxRetries && (error.name === "AbortError" || error.message.includes("fetch") || error.message.includes("network"))) {
+      if (onChunk) onChunk(`⏳ خطأ في الاتصال، جاري إعادة المحاولة... (${retryCount + 1}/${maxRetries})\n\n`)
+      await exponentialBackoff(retryCount)
+      return callOpenRouterStreaming(messages, modelId, systemPrompt, temperature, onChunk, retryCount + 1, maxRetries)
     }
-    if (onChunk) onChunk(`خطأ: ${error.message}`)
+
+    if (error.name === "AbortError") {
+      const timeoutMsg = "⏱️ انتهت مهلة الانتظار. يرجى المحاولة مرة أخرى."
+      if (onChunk) onChunk(timeoutMsg)
+      throw new Error(timeoutMsg)
+    }
+
+    if (onChunk && !error.message.includes("RATE_LIMITED") && !error.message.includes("SERVICE_BUSY")) {
+      onChunk(`خطأ: ${error.message}`)
+    }
     throw error
   }
 }
@@ -516,55 +631,143 @@ async function handleChatWithRetry(
   focusMode: "general" | "academic" | "writing" | "code" = "general",
 ) {
   const lastUserMessage = messages[messages.length - 1]?.content || ""
-
+  const lastMessage = messages[messages.length - 1]
+  
+  // التحقق من وجود صورة في الرسالة الحالية
+  const currentMessageHasImage = lastMessage?.image && lastMessage.image.trim() !== ""
+  
+  // البحث عن آخر صورة في الرسائل السابقة (للمتابعة في السياق)
+  let lastImageInContext: string | undefined = undefined
+  for (let i = messages.length - 2; i >= 0; i--) {
+    if (messages[i]?.image && messages[i].image.trim() !== "") {
+      lastImageInContext = messages[i].image
+      break
+    }
+  }
+  
   let modelToUse = selectedModel
-  if (selectedModel === "auto") {
-    modelToUse = selectBestModel(lastUserMessage)
-    console.log(`[v0] Auto-selected model: ${modelToUse}`)
+  const userSelectedSpecificModel = selectedModel && selectedModel !== "auto"
+  let messagesToSend = [...messages]
+  
+  // إذا كانت الرسالة الحالية تحتوي على صورة → استخدم nemotron
+  if (currentMessageHasImage) {
+    modelToUse = "nvidia/nemotron-nano-12b-v2-vl:free"
+    console.log(`[v0] Image in current message, using nemotron model`)
+  } 
+  // إذا لم تكن هناك صورة في الرسالة الحالية، لكن هناك صورة في السياق → استخدم nemotron وأضف الصورة للرسالة
+  else if (lastImageInContext) {
+    modelToUse = "nvidia/nemotron-nano-12b-v2-vl:free"
+    // إضافة الصورة من السياق للرسالة الحالية
+    messagesToSend = messages.map((msg, index) => {
+      if (index === messages.length - 1 && msg.role === "user") {
+        return { ...msg, image: lastImageInContext }
+      }
+      return msg
+    })
+    console.log(`[v0] Image in context, using nemotron model with context image`)
+  }
+  // إذا لم تكن هناك صور → استخدم xiaomi
+  else if (selectedModel === "auto") {
+    modelToUse = "xiaomi/mimo-v2-flash:free"
+    console.log(`[v0] No images, using xiaomi model`)
   }
 
-  const modelsToTry = modelToUse ? [modelToUse, ...FREE_MODELS.filter((m) => m !== modelToUse)] : FREE_MODELS
+  // إذا اختار المستخدم نموذج معين، استخدمه فقط (بدون نماذج بديلة)
+  // إلا إذا فشل بسبب service busy (ليس rate limit)
+  let modelsToTry = userSelectedSpecificModel 
+    ? [modelToUse!] // النموذج المختار فقط
+    : modelToUse 
+      ? [modelToUse, ...FREE_MODELS.filter((m) => m !== modelToUse)] 
+      : FREE_MODELS
 
   const isArabic = /[\u0600-\u06FF]/.test(lastUserMessage)
   const language = isArabic ? "ar" : "en"
 
-  let lastError = null
+  let lastError: Error | null = null
+  let apiKeyError = false
+  let rateLimitHit = false
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i]
     try {
       console.log(`[v0] Trying model ${i + 1}/${modelsToTry.length}: ${model}`)
 
+      // تم حذف رسالة "جاري تجربة نموذج بديل"
+
       const systemMessage = getSystemPrompt(isVoiceMode, deepThinking, language)
       const temperature = isVoiceMode ? 0.6 : deepThinking ? 0.9 : 0.7
 
       if (streaming && onChunk) {
-        const message = await callOpenRouterStreaming(messages, model, systemMessage, temperature, onChunk)
-        if (message && message.trim() !== "") {
+        const message = await callOpenRouterStreaming(messagesToSend, model, systemMessage, temperature, onChunk)
+        if (message && message.trim() !== "" && !message.includes("⚠️") && !message.includes("خطأ")) {
           console.log(`[v0] ✓ Success with model: ${model}`)
           return message
         }
       } else {
-        const message = await callOpenRouter(messages, model, systemMessage)
-        if (message && typeof message === "string" && message.trim() !== "") {
+        const message = await callOpenRouter(messagesToSend, model, systemMessage)
+        if (message && typeof message === "string" && message.trim() !== "" && !message.includes("⚠️")) {
           console.log(`[v0] ✓ Success with model: ${model}`)
           return NextResponse.json({ message })
         }
       }
     } catch (error: any) {
       lastError = error
-      console.error(`[v0] ✗ Model ${model} failed:`, error.message)
+      const errorMsg = error?.message || "خطأ غير معروف"
 
-      if (i < modelsToTry.length - 1) {
-        await delay(1000)
+      // التحقق من أخطاء API key
+      if (errorMsg.includes("API") || errorMsg.includes("مفتاح") || errorMsg.includes("API_KEY")) {
+        apiKeyError = true
+        break
+      }
+
+      console.error(`[v0] ✗ Model ${model} failed:`, errorMsg)
+
+      // إذا كان Rate Limit والنموذج مختار من المستخدم، توقف مباشرة
+      if (errorMsg.includes("RATE_LIMITED")) {
+        rateLimitHit = true
+        if (userSelectedSpecificModel) {
+          // إذا اختار المستخدم نموذج معين وحصل Rate Limit، لا تجرب نماذج أخرى
+          break
+        }
+        // إذا كان auto، تخطى هذا النموذج وجرب التالي
+        continue
+      }
+
+      // إذا كان service busy والنموذج مختار، جرب نماذج بديلة
+      if (errorMsg.includes("SERVICE_BUSY")) {
+        if (userSelectedSpecificModel && i === 0) {
+          // إذا فشل النموذج المختار بسبب service busy، جرب نماذج بديلة (2 نماذج فقط)
+          const fallbackModels = FREE_MODELS.filter((m) => m !== model).slice(0, 2)
+          if (fallbackModels.length > 0) {
+            modelsToTry = [...modelsToTry, ...fallbackModels]
+          }
+        }
+        if (i < modelsToTry.length - 1) {
+          await delay(1000)
+        }
+      } else if (i < modelsToTry.length - 1) {
+        await delay(500)
       }
     }
   }
 
-  const errorMsg =
-    language === "ar"
-      ? "عذراً، جميع النماذج مشغولة حالياً. يرجى المحاولة بعد قليل."
-      : "Sorry, all models are busy right now. Please try again shortly."
+  // رسائل خطأ محددة
+  let errorMsg = ""
+  if (apiKeyError && lastError) {
+    errorMsg = lastError.message
+  } else if (rateLimitHit || lastError?.message?.includes("RATE_LIMITED")) {
+    errorMsg = language === "ar"
+      ? "⏱️ تم تجاوز الحد المسموح من الطلبات لهذا النموذج. يرجى الانتظار قليلاً ثم المحاولة مرة أخرى."
+      : "⏱️ Rate limit exceeded for this model. Please wait a moment and try again."
+  } else if (lastError?.message?.includes("SERVICE_BUSY")) {
+    errorMsg = language === "ar"
+      ? "⏳ النموذج المختار مشغول حالياً. يرجى المحاولة بعد قليل."
+      : "⏳ The selected model is busy right now. Please try again shortly."
+  } else {
+    errorMsg = language === "ar"
+      ? "عذراً، لم نتمكن من الاتصال بالنموذج حالياً. يرجى المحاولة بعد قليل."
+      : "Sorry, we couldn't connect to the model right now. Please try again shortly."
+  }
 
   if (streaming && onChunk) {
     onChunk(errorMsg)

@@ -2,9 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import type { Message } from "@/types"
 
 const FREE_MODELS = [
-  "google/gemini-2.0-flash-exp:free",
-  "meta-llama/llama-3.2-3b-instruct:free",
-  "mistralai/mistral-7b-instruct:free",
+  "xiaomi/mimo-v2-flash:free",
 ]
 
 function selectBestModel(query: string): string {

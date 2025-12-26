@@ -323,7 +323,6 @@ export default function CodeBuilderPage() {
                     <span className="bg-zinc-900 px-2 py-1 rounded">xiaomi/mimo (المعماري)</span>
                     <span className="bg-zinc-900 px-2 py-1 rounded">kat-coder (واجهات)</span>
                     <span className="bg-zinc-900 px-2 py-1 rounded">devstral (خلفية)</span>
-                    <span className="bg-zinc-900 px-2 py-1 rounded">Hugging Face (تحليل بيانات)</span>
                   </div>
                 </div>
                 <div className="flex-1 p-4 overflow-y-auto">
